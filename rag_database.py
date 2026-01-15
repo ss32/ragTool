@@ -4,12 +4,15 @@ Handles ChromaDB operations for storing and retrieving document embeddings.
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
 import chromadb
 from chromadb.config import Settings
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
+
+from ollama_utils import ensure_model_available, OllamaModelError
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.rag_tool/chromadb")
 DEFAULT_COLLECTION_NAME = "rag_documents"
@@ -28,6 +31,13 @@ class RAGDatabase:
         self.db_path = db_path
         self.collection_name = collection_name
         self.embedding_model = embedding_model
+
+        # Ensure embedding model is available (download if needed)
+        try:
+            ensure_model_available(embedding_model)
+        except OllamaModelError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
         # Ensure database directory exists
         Path(db_path).mkdir(parents=True, exist_ok=True)

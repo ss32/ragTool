@@ -3,9 +3,11 @@ Query Engine Module
 Handles RAG-based querying with LLM response generation.
 """
 
+import sys
 from typing import List, Optional
 from langchain_ollama import ChatOllama
 from rag_database import RAGDatabase, DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from ollama_utils import ensure_model_available, OllamaModelError
 
 DEFAULT_LLM_MODEL = "qwen2.5:7b"
 
@@ -21,6 +23,14 @@ class QueryEngine:
         llm_model: str = DEFAULT_LLM_MODEL
     ):
         self.db = RAGDatabase(db_path, collection_name, embedding_model)
+
+        # Ensure LLM model is available (download if needed)
+        try:
+            ensure_model_available(llm_model)
+        except OllamaModelError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
         self.llm = ChatOllama(model=llm_model, temperature=0.1)
         self.llm_model = llm_model
 

@@ -3,9 +3,11 @@ Code Summarizer Module
 Uses LLM to generate documentation/summaries for code chunks.
 """
 
+import sys
 from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
+from ollama_utils import ensure_model_available, OllamaModelError
 
 DEFAULT_SUMMARIZER_MODEL = "qwen2.5:7b"
 
@@ -14,6 +16,13 @@ class CodeSummarizer:
     """Generates summaries and documentation for code chunks using LLM."""
 
     def __init__(self, model: str = DEFAULT_SUMMARIZER_MODEL):
+        # Ensure model is available (download if needed)
+        try:
+            ensure_model_available(model)
+        except OllamaModelError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
         self.llm = ChatOllama(model=model, temperature=0.1)
         self.model = model
 
