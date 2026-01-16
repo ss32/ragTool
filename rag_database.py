@@ -54,12 +54,29 @@ class RAGDatabase:
             metadata={"hnsw:space": "cosine"}
         )
 
-    def add_documents(self, documents: List[Document], batch_size: int = 50) -> int:
-        """Add documents to the database."""
+    def add_documents(
+        self,
+        documents: List[Document],
+        batch_size: int = 50,
+        quiet: bool = False
+    ) -> int:
+        """Add documents to the database.
+
+        Args:
+            documents: List of Document objects to add
+            batch_size: Number of documents to process at once
+            quiet: If True, suppress progress output
+
+        Returns:
+            Number of documents added
+        """
         if not documents:
             return 0
 
         total_added = 0
+
+        # Get current count to generate unique IDs
+        current_count = self.collection.count()
 
         # Process in batches for memory efficiency
         for i in range(0, len(documents), batch_size):
@@ -68,10 +85,12 @@ class RAGDatabase:
             # Prepare data for ChromaDB
             texts = [doc.page_content for doc in batch]
             metadatas = [doc.metadata for doc in batch]
-            ids = [f"doc_{i + j}" for j in range(len(batch))]
+            # Use current count + offset to ensure unique IDs across sessions
+            ids = [f"doc_{current_count + i + j}" for j in range(len(batch))]
 
             # Generate embeddings
-            print(f"Generating embeddings for batch {i // batch_size + 1}...")
+            if not quiet:
+                print(f"Generating embeddings for batch {i // batch_size + 1}...")
             embeddings = self.embeddings.embed_documents(texts)
 
             # Add to collection
@@ -83,7 +102,8 @@ class RAGDatabase:
             )
 
             total_added += len(batch)
-            print(f"  Added {total_added}/{len(documents)} documents")
+            if not quiet:
+                print(f"  Added {total_added}/{len(documents)} documents")
 
         return total_added
 

@@ -145,13 +145,36 @@ def load_document(file_path: Path) -> Optional[Document]:
         return None
 
 
-def load_documents(directory: str, recursive: bool = True) -> List[Document]:
-    """Load all documents from a directory."""
+def load_documents(
+    directory: str,
+    recursive: bool = True,
+    skip_files: Optional[set] = None
+) -> List[Document]:
+    """Load all documents from a directory.
+
+    Args:
+        directory: Path to the directory containing documents
+        recursive: Whether to search subdirectories
+        skip_files: Optional set of file paths to skip (for resume functionality)
+
+    Returns:
+        List of loaded Document objects
+    """
     files = discover_files(directory, recursive)
+
+    # Filter out already-processed files if resuming
+    if skip_files:
+        original_count = len(files)
+        files = [f for f in files if str(f) not in skip_files]
+        skipped = original_count - len(files)
+        if skipped > 0:
+            print(f"Found {original_count} supported files, skipping {skipped} already processed")
+        else:
+            print(f"Found {len(files)} supported files in {directory}")
+    else:
+        print(f"Found {len(files)} supported files in {directory}")
+
     documents = []
-
-    print(f"Found {len(files)} supported files in {directory}")
-
     for file_path in files:
         doc = load_document(file_path)
         if doc:
@@ -162,12 +185,36 @@ def load_documents(directory: str, recursive: bool = True) -> List[Document]:
     return documents
 
 
+def get_file_list(directory: str, recursive: bool = True) -> List[Path]:
+    """Get list of supported files without loading them.
+
+    Args:
+        directory: Path to the directory containing documents
+        recursive: Whether to search subdirectories
+
+    Returns:
+        List of Path objects for supported files
+    """
+    return discover_files(directory, recursive)
+
+
 def chunk_documents(
     documents: List[Document],
     chunk_size: int = 1000,
-    chunk_overlap: int = 200
+    chunk_overlap: int = 200,
+    quiet: bool = False
 ) -> List[Document]:
-    """Split documents into smaller chunks for embedding."""
+    """Split documents into smaller chunks for embedding.
+
+    Args:
+        documents: List of documents to chunk
+        chunk_size: Size of each chunk in characters
+        chunk_overlap: Overlap between chunks in characters
+        quiet: If True, suppress progress output
+
+    Returns:
+        List of chunked Document objects
+    """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -176,7 +223,8 @@ def chunk_documents(
     )
 
     chunks = text_splitter.split_documents(documents)
-    print(f"Split {len(documents)} documents into {len(chunks)} chunks")
+    if not quiet:
+        print(f"Split {len(documents)} documents into {len(chunks)} chunks")
     return chunks
 
 

@@ -15,61 +15,149 @@ import argparse
 import sys
 import os
 
-from document_loader import load_documents, chunk_documents
+from document_loader import load_documents, load_document, chunk_documents, get_file_list
 from rag_database import (
     create_database, RAGDatabase,
     DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
 )
 from query_engine import QueryEngine, DEFAULT_LLM_MODEL
-from code_summarizer import summarize_code_documents, DEFAULT_SUMMARIZER_MODEL
+from code_summarizer import summarize_code_documents, CodeSummarizer, DEFAULT_SUMMARIZER_MODEL
+from ingestion_tracker import IngestionTracker
 
 
 def cmd_create(args):
     """Create a new RAG database from documents."""
-    input_dir = args.input
+    input_dir = os.path.abspath(args.input)
     if not os.path.isdir(input_dir):
         print(f"Error: Directory not found: {input_dir}")
         sys.exit(1)
 
+    # Initialize tracker for resume functionality
+    tracker = IngestionTracker(args.db_path)
+
+    # Check for existing progress
+    resuming = False
+    skip_files = set()
+
+    if tracker.has_progress() and not args.fresh:
+        prev_input = tracker.get_input_directory()
+        if prev_input == input_dir:
+            stats = tracker.get_stats()
+            print(f"Resuming previous ingestion...")
+            print(f"  Previously processed: {stats['ingested_count']} files")
+            print(f"  Started: {stats['started_at']}")
+            skip_files = tracker.get_ingested_files()
+            resuming = True
+        else:
+            print(f"Warning: Previous ingestion was from a different directory:")
+            print(f"  Previous: {prev_input}")
+            print(f"  Current:  {input_dir}")
+            print(f"Use --fresh to start over, or use the same input directory to resume.")
+            sys.exit(1)
+    elif args.fresh and tracker.has_progress():
+        print("Starting fresh (clearing previous progress)...")
+        tracker.clear()
+
     print(f"Creating RAG database from: {input_dir}")
     print("=" * 60)
 
-    # Load documents
-    docs = load_documents(input_dir, recursive=not args.no_recursive)
+    # Get list of all files to process
+    all_files = get_file_list(input_dir, recursive=not args.no_recursive)
 
-    if not docs:
+    if not all_files:
         print("No supported documents found in the directory.")
         sys.exit(1)
 
-    # Summarize code documents if requested
-    if args.summarize:
-        print("\nGenerating documentation for code files...")
-        docs = summarize_code_documents(
-            docs,
-            model=args.summarize_model,
-            show_progress=True
-        )
+    # Filter out already-processed files
+    files_to_process = [f for f in all_files if str(f) not in skip_files]
 
-    # Chunk documents
-    chunks = chunk_documents(
-        docs,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap
-    )
+    if not files_to_process:
+        print("All files have already been processed!")
+        print("Use --fresh to re-process all files.")
+        sys.exit(0)
 
-    # Create database
-    db = create_database(
-        chunks,
+    print(f"Total files: {len(all_files)}")
+    if skip_files:
+        print(f"Already processed: {len(skip_files)}")
+    print(f"Files to process: {len(files_to_process)}")
+
+    # Record ingestion config
+    config = {
+        "chunk_size": args.chunk_size,
+        "chunk_overlap": args.chunk_overlap,
+        "summarize": args.summarize,
+        "embedding_model": args.embedding_model
+    }
+    tracker.start_ingestion(input_dir, config)
+
+    # Initialize database (don't clear if resuming)
+    clear_existing = not resuming and not args.append
+    db = RAGDatabase(
         db_path=args.db_path,
         collection_name=args.collection,
-        embedding_model=args.embedding_model,
-        clear_existing=not args.append
+        embedding_model=args.embedding_model
     )
+
+    if clear_existing:
+        db.clear()
+
+    print(f"\nDatabase path: {args.db_path}")
+    print(f"Collection: {args.collection}")
+    print(f"Embedding model: {args.embedding_model}")
+
+    # Initialize summarizer if needed
+    summarizer = None
+    if args.summarize:
+        print(f"Code summarization enabled (model: {args.summarize_model})")
+        summarizer = CodeSummarizer(model=args.summarize_model)
+
+    # Process files incrementally
+    print("\nProcessing files...")
+    processed_count = 0
+    total_chunks = 0
+
+    for i, file_path in enumerate(files_to_process):
+        try:
+            # Load single document
+            doc = load_document(file_path)
+            if not doc:
+                continue
+
+            print(f"[{i + 1}/{len(files_to_process)}] {file_path.name}")
+
+            # Summarize if it's code and summarization is enabled
+            if summarizer and doc.metadata.get('file_type') == 'source_code':
+                print(f"  Summarizing...")
+                doc = summarizer.summarize_document(doc)
+
+            # Chunk the document
+            chunks = chunk_documents([doc], args.chunk_size, args.chunk_overlap, quiet=True)
+
+            # Add to database
+            if chunks:
+                db.add_documents(chunks, quiet=True)
+                total_chunks += len(chunks)
+                print(f"  Added {len(chunks)} chunks")
+
+            # Mark as processed
+            tracker.mark_file_ingested(str(file_path))
+            processed_count += 1
+
+        except KeyboardInterrupt:
+            print(f"\n\nInterrupted! Progress saved.")
+            print(f"  Processed {processed_count}/{len(files_to_process)} files")
+            print(f"  Run the same command to resume.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"  Error processing {file_path.name}: {e}")
+            continue
 
     print("\n" + "=" * 60)
     print("Database creation complete!")
     stats = db.get_stats()
-    print(f"  Total chunks: {stats['document_count']}")
+    print(f"  Files processed this run: {processed_count}")
+    print(f"  Chunks added this run: {total_chunks}")
+    print(f"  Total chunks in database: {stats['document_count']}")
     print(f"  Database path: {stats['db_path']}")
     print(f"  Collection: {stats['collection_name']}")
     print("\nTo query: python rag_tool.py query \"your question here\"")
@@ -230,6 +318,11 @@ Examples:
         '--append',
         action='store_true',
         help='Append to existing database instead of clearing'
+    )
+    create_parser.add_argument(
+        '--fresh',
+        action='store_true',
+        help='Start fresh, ignoring any previous progress (clears existing data)'
     )
     create_parser.add_argument(
         '--summarize', '-s',
