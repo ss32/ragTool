@@ -1,45 +1,88 @@
-# Local RAG + Query
+# Local RAG Tool
 
-This tool uses `ollama` to create a vectorized database from an input directory containing text files, PDFs, source code, Markdown, etc. The database can then be queried for questions similar to NotebookLM, but everything is local, including the database.
+A local RAG (Retrieval-Augmented Generation) tool that creates vector databases from documents and lets you query them using Ollama LLMs. Similar to NotebookLM, but fully local.
 
-## Setup
+## Requirements
 
-`python3 -m pip install -r requirements.txt`
+- Python 3.10+
+- [Ollama](https://ollama.com/download) installed and running
 
-## Usage
-
-The most basic usage requires two steps
-
-1. `python3 rag_tool.py create --input /path/to/input/directory`
-2. `python3 rag_tool.py query "What does this code do?"`
-
-It is recommended that you name databases for querying later:
+## Quickstart
 
 ```bash
-python3 rag_tool.py create --name myDB --input /path/to/input/directory`
+# Install dependencies
+pip install -r requirements.txt
+
+# Create a database from your documents
+python3 rag_tool.py create --input /path/to/docs --name mydb
+
+# Query it
+python3 rag_tool.py query "What does this code do?" --name mydb
+
+# Or use the web GUI
+python3 rag_tool.py gui
 ```
 
-The same `--name` arg is used to query the database later
+## Commands
+
+### Create Database
 
 ```bash
-python3 rag_tool.py --name myDB query "What do?"
+python3 rag_tool.py create --input /path/to/docs --name mydb
 ```
 
-**Note:** The default mode for building the database optmizes speed over quality. The following examples cover a deeper but slower method for building the RAG database
+Options:
+- `--summarize`, `-s` — Generate LLM summaries for code files (slower but better quality)
+- `--workers N` — Parallel file loading
+- `--fresh` — Start fresh, ignore previous progress
 
-Pass the `--summarize` argument to pass the files to an LLM for context generation. This is particularly helpful if your input directory contains only source code and no documentation. The LLM will parse the code and make its best guess as to the functionality and use. This extra context is extremely useful when querying.
-
-### Choose a Model
-
-Every step of the process can be tuned to fit your compute budget. Pass the name of an [ollama model](https://ollama.com/) to use it for summary or querying.
-
-* Use `gpt-oss:20b` as a summary model using the `--summarize-model` arg
+### Query
 
 ```bash
-python3 rag_tool.py create -i /path/to/input --name myDB --summarize --summarize-model gpt-oss:20b
+python3 rag_tool.py query "Your question" --name mydb
 ```
 
-* Use `qwen2.5:7b` to query an existing database using the `--llm` arg
+Options:
+- `--stream` — Stream response tokens
+- `--llm-model MODEL` — Use a different LLM (default: qwen3:8b)
+- `--results N` — Number of context documents (default: 5)
+
+### Interactive Mode
 
 ```bash
- python3 rag_tool.py --name myDB query "Summarize what this code does" --llm qwen2.5:7b
+python3 rag_tool.py interactive --name mydb
+```
+
+### Web GUI
+
+```bash
+python3 rag_tool.py gui --host 0.0.0.0 --port 8000
+```
+
+Features a chat interface with database/model selection dropdowns and streaming responses.
+
+## Supported File Types
+
+| Type | Extensions |
+|------|------------|
+| Documents | `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html` |
+| Images | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp` |
+| Text | `.txt`, `.md`, `.rst` |
+| Code | `.py`, `.js`, `.ts`, `.cpp`, `.c`, `.java`, `.go`, `.rs`, `.rb`, `.sh`, `.json`, `.yaml`, etc. |
+
+## Models
+
+Models are auto-downloaded on first use. Defaults:
+
+| Purpose | Model |
+|---------|-------|
+| Embeddings | `all-minilm:33m` |
+| LLM | `qwen3:8b` |
+
+Change with `--embedding-model` or `--llm-model`.
+
+## Tips
+
+- Use `--summarize` when ingesting source code without documentation
+- Databases are stored in `~/.rag_tool/<name>/`
+- Ingestion is resumable — interrupt with Ctrl+C and run the same command to continue
