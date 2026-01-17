@@ -5,11 +5,12 @@ Uses LLM to generate documentation/summaries for code chunks.
 
 import sys
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
 from ollama_utils import ensure_model_available, OllamaModelError
 
-DEFAULT_SUMMARIZER_MODEL = "qwen2.5:7b"
+DEFAULT_SUMMARIZER_MODEL = "qwen3:8b"
 
 
 class CodeSummarizer:
@@ -108,7 +109,7 @@ SUMMARY:"""
         documents: List[Document],
         show_progress: bool = True
     ) -> List[Document]:
-        """Add summaries to all code documents."""
+        """Add summaries to all code documents (sequential)."""
         summarized = []
         code_docs = [d for d in documents if d.metadata.get('file_type') == 'source_code']
         other_docs = [d for d in documents if d.metadata.get('file_type') != 'source_code']
@@ -126,6 +127,66 @@ SUMMARY:"""
 
         if show_progress and code_docs:
             print(f"Summarization complete.")
+
+        # Return summarized code docs + unchanged other docs
+        return summarized + other_docs
+
+    def summarize_documents_parallel(
+        self,
+        documents: List[Document],
+        max_workers: int = 3,
+        show_progress: bool = True
+    ) -> List[Document]:
+        """Add summaries to all code documents using parallel LLM calls.
+
+        Args:
+            documents: List of documents to process
+            max_workers: Number of parallel workers for LLM calls (default: 3)
+            show_progress: Whether to show progress output
+
+        Returns:
+            List of documents with summaries added to code files
+        """
+        code_docs = [d for d in documents if d.metadata.get('file_type') == 'source_code']
+        other_docs = [d for d in documents if d.metadata.get('file_type') != 'source_code']
+
+        if not code_docs:
+            return documents
+
+        if show_progress:
+            print(f"\nGenerating summaries for {len(code_docs)} code files ({max_workers} workers)...")
+
+        summarized = []
+        errors = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all summarization tasks
+            future_to_doc = {
+                executor.submit(self.summarize_document, doc): doc
+                for doc in code_docs
+            }
+
+            completed = 0
+            for future in as_completed(future_to_doc):
+                original_doc = future_to_doc[future]
+                completed += 1
+
+                try:
+                    summarized_doc = future.result()
+                    summarized.append(summarized_doc)
+                    if show_progress:
+                        file_name = original_doc.metadata.get('file_name', 'unknown')
+                        print(f"  [{completed}/{len(code_docs)}] Summarized: {file_name}")
+                except Exception as e:
+                    # On error, keep the original document
+                    summarized.append(original_doc)
+                    errors.append((original_doc.metadata.get('file_name', 'unknown'), str(e)))
+                    if show_progress:
+                        file_name = original_doc.metadata.get('file_name', 'unknown')
+                        print(f"  [{completed}/{len(code_docs)}] Error summarizing {file_name}: {e}")
+
+        if show_progress:
+            print(f"Summarization complete. {len(code_docs) - len(errors)} succeeded, {len(errors)} failed.")
 
         # Return summarized code docs + unchanged other docs
         return summarized + other_docs

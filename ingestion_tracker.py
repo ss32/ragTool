@@ -15,9 +15,17 @@ class IngestionTracker:
 
     PROGRESS_FILE = "ingestion_progress.json"
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, auto_save_threshold: int = 10):
+        """Initialize the tracker.
+
+        Args:
+            db_path: Path to the database directory
+            auto_save_threshold: Number of files to accumulate before auto-saving (default: 10)
+        """
         self.db_path = db_path
         self.progress_file = os.path.join(db_path, self.PROGRESS_FILE)
+        self._auto_save_threshold = auto_save_threshold
+        self._pending_count = 0
         self._data: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict[str, Any]:
@@ -52,20 +60,46 @@ class IngestionTracker:
         """Get set of file paths that have been ingested."""
         return set(self._data.get("ingested_files", []))
 
-    def mark_file_ingested(self, file_path: str):
-        """Mark a single file as successfully ingested."""
+    def mark_file_ingested(self, file_path: str, force_save: bool = False):
+        """Mark a single file as successfully ingested.
+
+        Args:
+            file_path: Path to the file that was ingested
+            force_save: If True, save immediately regardless of threshold
+        """
         ingested = self._data.get("ingested_files", [])
         if file_path not in ingested:
             ingested.append(file_path)
             self._data["ingested_files"] = ingested
-            self._save()
+            self._pending_count += 1
 
-    def mark_files_ingested(self, file_paths: list):
-        """Mark multiple files as successfully ingested."""
+            # Auto-save when threshold reached or forced
+            if force_save or self._pending_count >= self._auto_save_threshold:
+                self._save()
+                self._pending_count = 0
+
+    def mark_files_ingested(self, file_paths: list, force_save: bool = True):
+        """Mark multiple files as successfully ingested.
+
+        Args:
+            file_paths: List of file paths that were ingested
+            force_save: If True (default), save immediately after marking
+        """
         ingested = set(self._data.get("ingested_files", []))
+        new_count = len(file_paths) - len(ingested.intersection(file_paths))
         ingested.update(file_paths)
         self._data["ingested_files"] = list(ingested)
-        self._save()
+        self._pending_count += new_count
+
+        if force_save:
+            self._save()
+            self._pending_count = 0
+
+    def flush(self):
+        """Force save any pending changes to disk."""
+        if self._pending_count > 0:
+            self._save()
+            self._pending_count = 0
 
     def start_ingestion(self, input_directory: str, config: Dict[str, Any]):
         """Record the start of an ingestion session."""
