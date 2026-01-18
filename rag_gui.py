@@ -11,8 +11,9 @@ from typing import Generator, List, Tuple
 import gradio as gr
 
 from query_engine import QueryEngine, DEFAULT_LLM_MODEL
-from rag_database import DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from rag_database import DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL, DEFAULT_VECTOR_WEIGHT
 from ollama_utils import get_available_models
+from reranker import DEFAULT_RERANK_MODEL
 
 
 # Global query engine instance (lazily initialized)
@@ -49,7 +50,11 @@ def get_db_path(db_name: str) -> str:
 def init_query_engine(
     db_name: str,
     llm_model: str = DEFAULT_LLM_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    enable_hybrid: bool = True,
+    vector_weight: float = DEFAULT_VECTOR_WEIGHT,
+    enable_reranking: bool = False,
+    rerank_model: str = DEFAULT_RERANK_MODEL
 ) -> Tuple[bool, str]:
     """Initialize or reinitialize the query engine."""
     global _query_engine, _current_db_name
@@ -66,12 +71,17 @@ def init_query_engine(
             embedding_model=embedding_model,
             llm_model=llm_model,
             warm_up=True,
-            enable_response_cache=True
+            enable_response_cache=True,
+            enable_hybrid=enable_hybrid,
+            vector_weight=vector_weight,
+            enable_reranking=enable_reranking,
+            rerank_model=rerank_model
         )
         _current_db_name = db_name
 
         stats = _query_engine.db.get_stats()
-        return True, f"Connected to '{db_name}' ({stats['document_count']} chunks)"
+        hybrid_status = "hybrid" if stats.get('hybrid_search') else "vector-only"
+        return True, f"Connected to '{db_name}' ({stats['document_count']} chunks, {hybrid_status})"
     except Exception as e:
         return False, f"Error connecting to database: {str(e)}"
 
@@ -152,7 +162,10 @@ def chat_response(
     db_name: str,
     llm_model: str,
     n_results: int,
-    use_streaming: bool
+    use_streaming: bool,
+    enable_hybrid: bool = True,
+    vector_weight: float = DEFAULT_VECTOR_WEIGHT,
+    enable_reranking: bool = False
 ) -> Generator[str, None, None]:
     """Generate chat response with optional streaming."""
     global _query_engine, _current_db_name
@@ -167,17 +180,32 @@ def chat_response(
 
     # Initialize or reinitialize if database changed
     if _query_engine is None or _current_db_name != db_name:
-        success, msg = init_query_engine(db_name, llm_model)
+        success, msg = init_query_engine(
+            db_name, llm_model,
+            enable_hybrid=enable_hybrid,
+            vector_weight=vector_weight,
+            enable_reranking=enable_reranking
+        )
         if not success:
             yield msg
             return
 
     # Check if LLM model changed
     if _query_engine.llm_model != llm_model:
-        success, msg = init_query_engine(db_name, llm_model)
+        success, msg = init_query_engine(
+            db_name, llm_model,
+            enable_hybrid=enable_hybrid,
+            vector_weight=vector_weight,
+            enable_reranking=enable_reranking
+        )
         if not success:
             yield msg
             return
+
+    # Update search settings if they changed
+    _query_engine.enable_hybrid = enable_hybrid
+    _query_engine.vector_weight = vector_weight
+    _query_engine.enable_reranking = enable_reranking
 
     try:
         if use_streaming:
@@ -313,6 +341,26 @@ def create_gui(
                     value=True
                 )
 
+                gr.Markdown("### Search Settings")
+
+                hybrid_checkbox = gr.Checkbox(
+                    label="Hybrid Search (BM25 + Vector)",
+                    value=True
+                )
+
+                vector_weight_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=DEFAULT_VECTOR_WEIGHT,
+                    step=0.1,
+                    label="Vector Weight (BM25 = 1 - this)"
+                )
+
+                reranking_checkbox = gr.Checkbox(
+                    label="Enable Reranking (slower, better quality)",
+                    value=False
+                )
+
                 gr.Markdown("### Database Info")
                 stats_text = gr.Textbox(
                     label="Statistics",
@@ -340,7 +388,8 @@ def create_gui(
             history = history + [gr.ChatMessage(role="user", content=message)]
             return "", history
 
-        def bot_response(history, db_name, llm_model, n_results, use_streaming):
+        def bot_response(history, db_name, llm_model, n_results, use_streaming,
+                         enable_hybrid, vector_weight, enable_reranking):
             """Generate bot response."""
             if not history:
                 return history
@@ -376,7 +425,8 @@ def create_gui(
 
             # Generate response
             for response in chat_response(
-                user_msg, old_history, db_name, llm_model, n_results, use_streaming
+                user_msg, old_history, db_name, llm_model, n_results, use_streaming,
+                enable_hybrid, vector_weight, enable_reranking
             ):
                 # Yield history with assistant response
                 yield history + [gr.ChatMessage(role="assistant", content=response)]
@@ -389,7 +439,8 @@ def create_gui(
             queue=False
         ).then(
             bot_response,
-            [chatbot, db_dropdown, llm_model_dropdown, n_results_slider, streaming_checkbox],
+            [chatbot, db_dropdown, llm_model_dropdown, n_results_slider, streaming_checkbox,
+             hybrid_checkbox, vector_weight_slider, reranking_checkbox],
             chatbot
         )
 
@@ -400,7 +451,8 @@ def create_gui(
             queue=False
         ).then(
             bot_response,
-            [chatbot, db_dropdown, llm_model_dropdown, n_results_slider, streaming_checkbox],
+            [chatbot, db_dropdown, llm_model_dropdown, n_results_slider, streaming_checkbox,
+             hybrid_checkbox, vector_weight_slider, reranking_checkbox],
             chatbot
         )
 

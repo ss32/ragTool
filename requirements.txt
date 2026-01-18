@@ -5,3 +5,8 @@ chromadb>=0.4.0
 docling>=2.0.0
 langchain-docling>=0.2.0
 gradio>=4.0.0
+# Hybrid search dependencies
+bm25s>=0.2.0
+PyStemmer>=2.2.0
+# Reranking dependencies
+sentence-transformers>=2.2.0

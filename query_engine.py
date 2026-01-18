@@ -1,6 +1,7 @@
 """
 Query Engine Module
 Handles RAG-based querying with LLM response generation.
+Supports hybrid search (BM25 + vector) and optional cross-encoder reranking.
 """
 
 import asyncio
@@ -10,8 +11,12 @@ import hashlib
 from pathlib import Path
 from typing import List, Optional, Iterator, AsyncIterator
 from langchain_ollama import ChatOllama
-from rag_database import RAGDatabase, DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from rag_database import (
+    RAGDatabase, DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_VECTOR_WEIGHT
+)
 from ollama_utils import ensure_model_available, OllamaModelError
+from reranker import Reranker, DEFAULT_RERANK_MODEL
 
 DEFAULT_LLM_MODEL = "qwen3:8b"
 DEFAULT_RESPONSE_CACHE_SIZE = 500
@@ -29,9 +34,27 @@ class QueryEngine:
         warm_up: bool = True,
         enable_response_cache: bool = True,
         response_cache_size: int = DEFAULT_RESPONSE_CACHE_SIZE,
-        hnsw_search_ef: int = 100
+        hnsw_search_ef: int = 100,
+        enable_hybrid: bool = True,
+        vector_weight: float = DEFAULT_VECTOR_WEIGHT,
+        enable_reranking: bool = False,
+        rerank_model: str = DEFAULT_RERANK_MODEL
     ):
-        self.db = RAGDatabase(db_path, collection_name, embedding_model, hnsw_search_ef=hnsw_search_ef)
+        # Store hybrid search settings
+        self.enable_hybrid = enable_hybrid
+        self.vector_weight = vector_weight
+        self.enable_reranking = enable_reranking
+        self.rerank_model = rerank_model
+
+        # Initialize reranker (lazy loading)
+        self._reranker: Optional[Reranker] = None
+
+        self.db = RAGDatabase(
+            db_path, collection_name, embedding_model,
+            hnsw_search_ef=hnsw_search_ef,
+            enable_bm25=enable_hybrid,
+            vector_weight=vector_weight
+        )
 
         # Ensure LLM model is available (download if needed)
         try:
@@ -135,15 +158,88 @@ QUESTION: {question}
 
 ANSWER:"""
 
+    def _get_reranker(self) -> Reranker:
+        """Get or create the reranker instance."""
+        if self._reranker is None:
+            self._reranker = Reranker(model=self.rerank_model)
+        return self._reranker
+
+    def _retrieve_documents(
+        self,
+        question: str,
+        n_results: int = 5,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
+    ) -> List[dict]:
+        """Retrieve documents using configured search strategy.
+
+        Args:
+            question: The search query
+            n_results: Number of final results to return
+            use_hybrid: Override hybrid search setting (None = use instance default)
+            use_reranking: Override reranking setting (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
+
+        Returns:
+            List of retrieved documents
+        """
+        if use_hybrid is None:
+            use_hybrid = self.enable_hybrid
+        if use_reranking is None:
+            use_reranking = self.enable_reranking
+        if vector_weight is None:
+            vector_weight = self.vector_weight
+
+        # Get more candidates if reranking (reranker will filter down)
+        n_candidates = n_results * 3 if use_reranking else n_results
+
+        # Retrieve documents
+        if use_hybrid and self.db.bm25_index is not None:
+            results = self.db.hybrid_search(
+                question,
+                n_results=n_candidates,
+                vector_weight=vector_weight
+            )
+        else:
+            results = self.db.search(question, n_results=n_candidates)
+
+        # Apply reranking if enabled
+        if use_reranking and results:
+            reranker = self._get_reranker()
+            results = reranker.rerank(question, results, top_k=n_results)
+
+        return results[:n_results]
+
     def query(
         self,
         question: str,
         n_results: int = 5,
-        show_sources: bool = True
+        show_sources: bool = True,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
     ) -> str:
-        """Query the RAG database and generate a response."""
-        # Search for relevant documents
-        results = self.db.search(question, n_results=n_results)
+        """Query the RAG database and generate a response.
+
+        Args:
+            question: The question to answer
+            n_results: Number of context documents to retrieve
+            show_sources: Whether to include source documents in response
+            use_hybrid: Override hybrid search (None = use instance default)
+            use_reranking: Override reranking (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
+
+        Returns:
+            Generated answer string
+        """
+        # Retrieve documents using configured strategy
+        results = self._retrieve_documents(
+            question, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
         if not results:
             return "No relevant documents found in the database."
@@ -189,11 +285,31 @@ ANSWER:"""
         self,
         question: str,
         n_results: int = 5,
-        show_sources: bool = True
+        show_sources: bool = True,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
     ) -> Iterator[str]:
-        """Query with streaming response for faster perceived latency."""
-        # Search for relevant documents
-        results = self.db.search(question, n_results=n_results)
+        """Query with streaming response for faster perceived latency.
+
+        Args:
+            question: The question to answer
+            n_results: Number of context documents to retrieve
+            show_sources: Whether to include source documents
+            use_hybrid: Override hybrid search (None = use instance default)
+            use_reranking: Override reranking (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
+
+        Yields:
+            Response tokens as they are generated
+        """
+        # Retrieve documents using configured strategy
+        results = self._retrieve_documents(
+            question, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
         if not results:
             yield "No relevant documents found in the database."
@@ -237,9 +353,32 @@ ANSWER:"""
             source_list = "\n".join(f"  - {s}" for s in sources)
             yield f"\n\nSources:\n{source_list}"
 
-    def search_only(self, query: str, n_results: int = 5) -> List[dict]:
-        """Perform similarity search without LLM generation."""
-        return self.db.search(query, n_results=n_results)
+    def search_only(
+        self,
+        query: str,
+        n_results: int = 5,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
+    ) -> List[dict]:
+        """Perform search without LLM generation.
+
+        Args:
+            query: The search query
+            n_results: Number of results to return
+            use_hybrid: Override hybrid search (None = use instance default)
+            use_reranking: Override reranking (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
+
+        Returns:
+            List of search results
+        """
+        return self._retrieve_documents(
+            query, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
     # =========================================================================
     # Async Methods
@@ -252,15 +391,63 @@ ANSWER:"""
         except Exception:
             pass  # Ignore warm-up errors
 
-    async def search_only_async(self, query: str, n_results: int = 5) -> List[dict]:
-        """Perform similarity search without LLM generation (async version)."""
-        return await self.db.search_async(query, n_results=n_results)
+    async def _retrieve_documents_async(
+        self,
+        question: str,
+        n_results: int = 5,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
+    ) -> List[dict]:
+        """Retrieve documents using configured search strategy (async version)."""
+        if use_hybrid is None:
+            use_hybrid = self.enable_hybrid
+        if use_reranking is None:
+            use_reranking = self.enable_reranking
+        if vector_weight is None:
+            vector_weight = self.vector_weight
+
+        n_candidates = n_results * 3 if use_reranking else n_results
+
+        if use_hybrid and self.db.bm25_index is not None:
+            results = await self.db.hybrid_search_async(
+                question, n_results=n_candidates, vector_weight=vector_weight
+            )
+        else:
+            results = await self.db.search_async(question, n_results=n_candidates)
+
+        if use_reranking and results:
+            reranker = self._get_reranker()
+            results = await asyncio.to_thread(
+                reranker.rerank, question, results, n_results
+            )
+
+        return results[:n_results]
+
+    async def search_only_async(
+        self,
+        query: str,
+        n_results: int = 5,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
+    ) -> List[dict]:
+        """Perform search without LLM generation (async version)."""
+        return await self._retrieve_documents_async(
+            query, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
     async def query_async(
         self,
         question: str,
         n_results: int = 5,
-        show_sources: bool = True
+        show_sources: bool = True,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
     ) -> str:
         """Query the RAG database and generate a response (async version).
 
@@ -271,12 +458,20 @@ ANSWER:"""
             question: The question to answer
             n_results: Number of documents to retrieve for context
             show_sources: Whether to include source documents in the response
+            use_hybrid: Override hybrid search (None = use instance default)
+            use_reranking: Override reranking (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
 
         Returns:
             The generated answer string
         """
-        # Search for relevant documents (async)
-        results = await self.db.search_async(question, n_results=n_results)
+        # Retrieve documents using configured strategy (async)
+        results = await self._retrieve_documents_async(
+            question, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
         if not results:
             return "No relevant documents found in the database."
@@ -322,7 +517,10 @@ ANSWER:"""
         self,
         question: str,
         n_results: int = 5,
-        show_sources: bool = True
+        show_sources: bool = True,
+        use_hybrid: Optional[bool] = None,
+        use_reranking: Optional[bool] = None,
+        vector_weight: Optional[float] = None
     ) -> AsyncIterator[str]:
         """Query with streaming response (async generator version).
 
@@ -332,12 +530,20 @@ ANSWER:"""
             question: The question to answer
             n_results: Number of documents to retrieve for context
             show_sources: Whether to include source documents at the end
+            use_hybrid: Override hybrid search (None = use instance default)
+            use_reranking: Override reranking (None = use instance default)
+            vector_weight: Override vector weight (None = use instance default)
 
         Yields:
             Response tokens as they are generated
         """
-        # Search for relevant documents (async)
-        results = await self.db.search_async(question, n_results=n_results)
+        # Retrieve documents using configured strategy (async)
+        results = await self._retrieve_documents_async(
+            question, n_results,
+            use_hybrid=use_hybrid,
+            use_reranking=use_reranking,
+            vector_weight=vector_weight
+        )
 
         if not results:
             yield "No relevant documents found in the database."

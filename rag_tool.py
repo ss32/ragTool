@@ -23,12 +23,14 @@ from document_loader import (
 )
 from rag_database import (
     create_database, RAGDatabase,
-    DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+    DEFAULT_DB_PATH, DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_VECTOR_WEIGHT
 )
 from query_engine import QueryEngine, DEFAULT_LLM_MODEL
 from code_summarizer import summarize_code_documents, CodeSummarizer, DEFAULT_SUMMARIZER_MODEL
 from ingestion_tracker import IngestionTracker
 from rag_gui import launch_gui
+from reranker import DEFAULT_RERANK_MODEL
 
 
 def cmd_create(args):
@@ -99,11 +101,13 @@ def cmd_create(args):
 
     # Initialize database (don't clear if resuming)
     clear_existing = not resuming and not args.append
+    enable_bm25 = not getattr(args, 'no_bm25', False)
     db = RAGDatabase(
         db_path=args.db_path,
         collection_name=args.collection,
         embedding_model=args.embedding_model,
-        hnsw_search_ef=args.hnsw_ef
+        hnsw_search_ef=args.hnsw_ef,
+        enable_bm25=enable_bm25
     )
 
     if clear_existing:
@@ -373,6 +377,12 @@ def cmd_query(args):
 
 def _cmd_query_sync(args):
     """Synchronous query implementation."""
+    # Get hybrid search settings
+    use_hybrid = not getattr(args, 'no_hybrid', False)
+    use_reranking = getattr(args, 'rerank', False)
+    vector_weight = getattr(args, 'vector_weight', DEFAULT_VECTOR_WEIGHT)
+    rerank_model = getattr(args, 'rerank_model', DEFAULT_RERANK_MODEL)
+
     engine = QueryEngine(
         db_path=args.db_path,
         collection_name=args.collection,
@@ -380,7 +390,11 @@ def _cmd_query_sync(args):
         llm_model=args.llm_model,
         warm_up=not args.no_warmup,
         enable_response_cache=not args.no_cache,
-        hnsw_search_ef=args.hnsw_ef
+        hnsw_search_ef=args.hnsw_ef,
+        enable_hybrid=use_hybrid,
+        vector_weight=vector_weight,
+        enable_reranking=use_reranking,
+        rerank_model=rerank_model
     )
 
     stats = engine.db.get_stats()
@@ -390,13 +404,35 @@ def _cmd_query_sync(args):
 
     question = args.question
     print(f"Question: {question}")
+    if use_hybrid:
+        print(f"Search: hybrid (vector weight: {vector_weight:.1f})")
+    else:
+        print(f"Search: vector only")
+    if use_reranking:
+        print(f"Reranking: enabled ({rerank_model})")
     print("-" * 60)
 
     if args.search_only:
         results = engine.search_only(question, n_results=args.results)
         print(f"\nFound {len(results)} results:")
         for i, result in enumerate(results):
-            print(f"\n[{i + 1}] Distance: {result['distance']:.4f}")
+            # Display score based on search type
+            if 'rerank_score' in result:
+                print(f"\n[{i + 1}] Rerank Score: {result['rerank_score']:.4f}")
+            elif 'rrf_score' in result:
+                print(f"\n[{i + 1}] RRF Score: {result['rrf_score']:.4f}")
+            elif 'distance' in result and result['distance'] is not None:
+                print(f"\n[{i + 1}] Distance: {result['distance']:.4f}")
+            else:
+                print(f"\n[{i + 1}]")
+            # Show rank info if available
+            if result.get('bm25_rank') is not None or result.get('vector_rank') is not None:
+                ranks = []
+                if result.get('bm25_rank') is not None:
+                    ranks.append(f"BM25: #{result['bm25_rank']+1}")
+                if result.get('vector_rank') is not None:
+                    ranks.append(f"Vector: #{result['vector_rank']+1}")
+                print(f"    Ranks: {', '.join(ranks)}")
             print(f"    Source: {result['metadata'].get('source', 'unknown')}")
             print(f"    Content: {result['content'][:300]}...")
     elif args.stream:
@@ -418,6 +454,12 @@ def _cmd_query_sync(args):
 
 async def _cmd_query_async(args):
     """Async query implementation."""
+    # Get hybrid search settings
+    use_hybrid = not getattr(args, 'no_hybrid', False)
+    use_reranking = getattr(args, 'rerank', False)
+    vector_weight = getattr(args, 'vector_weight', DEFAULT_VECTOR_WEIGHT)
+    rerank_model = getattr(args, 'rerank_model', DEFAULT_RERANK_MODEL)
+
     engine = QueryEngine(
         db_path=args.db_path,
         collection_name=args.collection,
@@ -425,7 +467,11 @@ async def _cmd_query_async(args):
         llm_model=args.llm_model,
         warm_up=not args.no_warmup,
         enable_response_cache=not args.no_cache,
-        hnsw_search_ef=args.hnsw_ef
+        hnsw_search_ef=args.hnsw_ef,
+        enable_hybrid=use_hybrid,
+        vector_weight=vector_weight,
+        enable_reranking=use_reranking,
+        rerank_model=rerank_model
     )
 
     stats = engine.db.get_stats()
@@ -435,13 +481,27 @@ async def _cmd_query_async(args):
 
     question = args.question
     print(f"Question: {question} (async mode)")
+    if use_hybrid:
+        print(f"Search: hybrid (vector weight: {vector_weight:.1f})")
+    else:
+        print(f"Search: vector only")
+    if use_reranking:
+        print(f"Reranking: enabled ({rerank_model})")
     print("-" * 60)
 
     if args.search_only:
         results = await engine.search_only_async(question, n_results=args.results)
         print(f"\nFound {len(results)} results:")
         for i, result in enumerate(results):
-            print(f"\n[{i + 1}] Distance: {result['distance']:.4f}")
+            # Display score based on search type
+            if 'rerank_score' in result:
+                print(f"\n[{i + 1}] Rerank Score: {result['rerank_score']:.4f}")
+            elif 'rrf_score' in result:
+                print(f"\n[{i + 1}] RRF Score: {result['rrf_score']:.4f}")
+            elif 'distance' in result and result['distance'] is not None:
+                print(f"\n[{i + 1}] Distance: {result['distance']:.4f}")
+            else:
+                print(f"\n[{i + 1}]")
             print(f"    Source: {result['metadata'].get('source', 'unknown')}")
             print(f"    Content: {result['content'][:300]}...")
     elif args.stream:
@@ -465,6 +525,12 @@ def cmd_interactive(args):
     """Start interactive query session."""
     use_async = getattr(args, 'use_async', False)
 
+    # Get hybrid search settings
+    use_hybrid = not getattr(args, 'no_hybrid', False)
+    use_reranking = getattr(args, 'rerank', False)
+    vector_weight = getattr(args, 'vector_weight', DEFAULT_VECTOR_WEIGHT)
+    rerank_model = getattr(args, 'rerank_model', DEFAULT_RERANK_MODEL)
+
     engine = QueryEngine(
         db_path=args.db_path,
         collection_name=args.collection,
@@ -472,7 +538,11 @@ def cmd_interactive(args):
         llm_model=args.llm_model,
         warm_up=not args.no_warmup,
         enable_response_cache=not args.no_cache,
-        hnsw_search_ef=args.hnsw_ef
+        hnsw_search_ef=args.hnsw_ef,
+        enable_hybrid=use_hybrid,
+        vector_weight=vector_weight,
+        enable_reranking=use_reranking,
+        rerank_model=rerank_model
     )
 
     stats = engine.db.get_stats()
@@ -790,6 +860,11 @@ Examples:
              'Higher values speed up I/O-bound loading. '
              'Note: Parallel loading is disabled when --summarize is used.'
     )
+    create_parser.add_argument(
+        '--no-bm25',
+        action='store_true',
+        help='Skip BM25 index creation (disables hybrid search)'
+    )
     create_parser.set_defaults(func=cmd_create)
 
     # Query command
@@ -846,6 +921,30 @@ Examples:
         help='Use async operations for non-blocking I/O. '
              'Enables concurrent embedding and search operations.'
     )
+    # Hybrid search options
+    query_parser.add_argument(
+        '--no-hybrid',
+        action='store_true',
+        help='Disable hybrid search (use vector-only search)'
+    )
+    query_parser.add_argument(
+        '--vector-weight',
+        type=float,
+        default=DEFAULT_VECTOR_WEIGHT,
+        help=f'Weight for vector search in hybrid mode (0.0-1.0, default: {DEFAULT_VECTOR_WEIGHT}). '
+             'BM25 weight = 1.0 - vector_weight'
+    )
+    # Reranking options
+    query_parser.add_argument(
+        '--rerank',
+        action='store_true',
+        help='Enable cross-encoder reranking (improves quality, slower)'
+    )
+    query_parser.add_argument(
+        '--rerank-model',
+        default=DEFAULT_RERANK_MODEL,
+        help=f'Reranker model (default: {DEFAULT_RERANK_MODEL})'
+    )
     query_parser.set_defaults(func=cmd_query)
 
     # Interactive command
@@ -881,6 +980,29 @@ Examples:
         action='store_true',
         help='Use async operations for non-blocking I/O. '
              'Enables concurrent embedding and search operations.'
+    )
+    # Hybrid search options
+    interactive_parser.add_argument(
+        '--no-hybrid',
+        action='store_true',
+        help='Disable hybrid search (use vector-only search)'
+    )
+    interactive_parser.add_argument(
+        '--vector-weight',
+        type=float,
+        default=DEFAULT_VECTOR_WEIGHT,
+        help=f'Weight for vector search in hybrid mode (0.0-1.0, default: {DEFAULT_VECTOR_WEIGHT})'
+    )
+    # Reranking options
+    interactive_parser.add_argument(
+        '--rerank',
+        action='store_true',
+        help='Enable cross-encoder reranking (improves quality, slower)'
+    )
+    interactive_parser.add_argument(
+        '--rerank-model',
+        default=DEFAULT_RERANK_MODEL,
+        help=f'Reranker model (default: {DEFAULT_RERANK_MODEL})'
     )
     interactive_parser.set_defaults(func=cmd_interactive)
 
